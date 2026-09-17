@@ -1,0 +1,815 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Building a Small Language Model from Cutter's Rules for a Dictionary Catalogue</title>
+<style>
+  :root { --ink:#111; --muted:#555; --line:#cfcfcf; --paper:#fff; --code:#f6f6f6; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--paper); color:var(--ink); font-family:Georgia, "Times New Roman", serif; line-height:1.55; }
+  main { max-width:1100px; margin:0 auto; padding:42px 28px 80px; }
+  h1,h2,h3 { line-height:1.2; }
+  h1 { font-size:2.25rem; margin-bottom:.3rem; }
+  h2 { margin-top:2.4rem; border-bottom:1px solid var(--line); padding-bottom:.35rem; }
+  h3 { margin-top:1.6rem; }
+  .subtitle,.note { color:var(--muted); }
+  .box { border:1px solid var(--line); padding:18px; margin:18px 0; }
+  pre { background:var(--code); border:1px solid var(--line); padding:16px; overflow:auto; line-height:1.35; font-family:Menlo,Consolas,monospace; font-size:.9rem; }
+  code { font-family:Menlo,Consolas,monospace; }
+  table { width:100%; border-collapse:collapse; margin:18px 0; }
+  th,td { border:1px solid var(--line); padding:10px; text-align:left; vertical-align:top; }
+  th { background:#f5f5f5; }
+  a { color:#0645ad; }
+  .small { font-size:.92rem; }
+  .schema { white-space:pre-wrap; }
+  .toc a { text-decoration:none; }
+  .ref { padding-left:2em; text-indent:-2em; margin:.8em 0; }
+</style>
+</head>
+<body>
+<main>
+<header>
+<h1>Building a Small Language Model from <em>Rules for a Dictionary Catalogue</em></h1>
+<p class="subtitle">A single-page Python-oriented design for corpus extraction, catalogue-aware parsing, tokenization, training examples, a small causal Transformer, evaluation, and generation.</p>
+</header>
+
+<div class="box">
+<strong>Source basis.</strong> The attached EPUB is Charles A. Cutter's <em>Rules for a Dictionary Catalogue</em>, third edition (1891), U.S. Bureau of Education Special Report on Public Libraries—Part II. The Project Gutenberg edition is eBook No. 59215 and is identified by Gutenberg as public domain in the United States (Project Gutenberg, 2019/2020). This page uses the attached book as the domain corpus and modern Python/PyTorch sources for the machine-learning implementation.
+</div>
+
+<h2>Contents</h2>
+<p class="toc">
+<a href="#goal">1. Goal</a> ·
+<a href="#source">2. Corpus structure</a> ·
+<a href="#architecture">3. ASCII architecture</a> ·
+<a href="#schema">4. Training schema</a> ·
+<a href="#extract">5. EPUB extraction</a> ·
+<a href="#parse">6. Parsing</a> ·
+<a href="#tokenize">7. Tokenization</a> ·
+<a href="#dataset">8. Dataset</a> ·
+<a href="#model">9. Model</a> ·
+<a href="#train">10. Training</a> ·
+<a href="#generate">11. Generation</a> ·
+<a href="#evaluation">12. Evaluation</a> ·
+<a href="#method">13. Methodology</a> ·
+<a href="#refs">References</a>
+</p>
+
+<section id="goal">
+<h2>1. Goal: a small domain language model</h2>
+<p>The project is not intended to reproduce a general-purpose chatbot. It is a compact <strong>autoregressive language model</strong> trained to learn the vocabulary, phrasing, definitions, entry rules, and relationships present in Cutter's catalogue text. Given preceding tokens, it learns to assign scores to possible next tokens.</p>
+
+<pre>
+context tokens
+      |
+      v
+ P(next token | preceding tokens)
+      |
+      v
+next-token prediction
+      |
+      +---- appended to context ----+
+                                    |
+                                    +----> model again
+</pre>
+
+<p>The corpus is especially useful pedagogically because Cutter explicitly organizes knowledge around <em>objects</em>, <em>means</em>, definitions, author-entry, title-entry, subject-entry, form-entry, references, headings, titles, editions, imprints, notes, language, punctuation, arrangement, appendices, and an index. Those divisions can be retained as metadata instead of flattening the entire book immediately.</p>
+</section>
+
+<section id="source">
+<h2>2. What the attached catalogue contributes</h2>
+<p>Cutter states three broad catalogue objectives: enable a person to find a book when author, title, or subject is known; show what the library has by an author, on a subject, or in a kind of literature; and assist in choosing a book by edition or character. He associates those objectives with author, title, subject, form, edition/imprint, reference, and note mechanisms (Cutter, 1891).</p>
+
+<table>
+<tr><th>Catalogue concept</th><th>Useful SLM representation</th></tr>
+<tr><td>Author-entry</td><td><code>&lt;SECTION_AUTHOR_ENTRY&gt;</code></td></tr>
+<tr><td>Title-entry</td><td><code>&lt;SECTION_TITLE_ENTRY&gt;</code></td></tr>
+<tr><td>Subject-entry</td><td><code>&lt;SECTION_SUBJECT_ENTRY&gt;</code></td></tr>
+<tr><td>Form-entry</td><td><code>&lt;SECTION_FORM_ENTRY&gt;</code></td></tr>
+<tr><td>Definitions</td><td><code>&lt;DEFINITION&gt; term ... description ...</code></td></tr>
+<tr><td>Examples</td><td><code>&lt;EXAMPLE&gt; ...</code></td></tr>
+<tr><td>References / cross-references</td><td><code>&lt;REFERENCE&gt; ...</code></td></tr>
+<tr><td>Rules</td><td><code>&lt;RULE&gt; ...</code></td></tr>
+</table>
+
+<p>This is a <strong>modern training schema imposed for the experiment</strong>; those angle-bracket labels are not Cutter's original markup. Their purpose is to preserve document structure during training.</p>
+</section>
+
+<section id="architecture">
+<h2>3. Full ASCII architecture</h2>
+<pre>
+ ATTACHED EPUB
+ Rules for a Dictionary Catalogue
+             |
+             v
+ +---------------------------+
+ | 1. EPUB / XHTML EXTRACTOR |
+ | zipfile + HTML parser     |
+ +-------------+-------------+
+               |
+               v
+ +---------------------------+
+ | 2. CORPUS CLEANER         |
+ | Unicode / whitespace      |
+ | remove navigation noise   |
+ | retain punctuation        |
+ +-------------+-------------+
+               |
+               v
+ +---------------------------+
+ | 3. CATALOGUE PARSER       |
+ | headings                  |
+ | rules                     |
+ | definitions               |
+ | examples                  |
+ | references                |
+ +-------------+-------------+
+               |
+               v
+ +---------------------------+
+ | 4. STRUCTURED CORPUS      |
+ | <SECTION> ...             |
+ | <RULE> ...                |
+ | <DEFINITION> ...          |
+ +-------------+-------------+
+               |
+               v
+ +---------------------------+
+ | 5. TOKENIZER              |
+ | educational regex first   |
+ | subword tokenizer later   |
+ +-------------+-------------+
+               |
+               v
+          TOKEN IDs
+       [18, 91, 44, ...]
+               |
+               v
+ +---------------------------+
+ | 6. SEQUENCE BUILDER       |
+ | context window = N        |
+ | X = tokens[:-1]           |
+ | Y = tokens[1:]            |
+ +-------------+-------------+
+               |
+        +------+------+
+        |             |
+        v             v
+     TRAIN          VALIDATION
+        |
+        v
+ +---------------------------+
+ | 7. SMALL CAUSAL MODEL     |
+ | token embedding           |
+ | position embedding        |
+ | causal self-attention     |
+ | feed-forward layers       |
+ | vocabulary projection     |
+ +-------------+-------------+
+               |
+               v
+       VOCABULARY LOGITS
+               |
+               v
+ +---------------------------+
+ | 8. CROSS-ENTROPY LOSS     |
+ +-------------+-------------+
+               |
+               v
+ +---------------------------+
+ | 9. BACKPROP + ADAMW       |
+ +-------------+-------------+
+               |
+               +--------------------+
+               |                    |
+               +---- next batch <---+
+
+ INFERENCE
+ ---------
+ "Author-entry" -> tokenize -> model -> sample next ID
+                                  |
+                                  v
+                              decode token
+                                  |
+                                  v
+                              append/repeat
+</pre>
+</section>
+
+<section id="schema">
+<h2>4. Corpus and training schema</h2>
+<p>A useful intermediate record separates source structure from model tokens:</p>
+<pre class="schema">{
+  "document": "Rules for a Dictionary Catalogue",
+  "author": "Charles A. Cutter",
+  "edition": "Third edition",
+  "year": 1891,
+  "section": "III. Subject-Entry",
+  "record_type": "rule",
+  "text": "...source text...",
+  "source_file": "...xhtml",
+  "sequence": 123
+}</pre>
+
+<p>Then serialize selected records into a training stream:</p>
+<pre>&lt;BOS&gt;
+&lt;SECTION_SUBJECT_ENTRY&gt;
+&lt;RULE&gt; ... text from the source ...
+&lt;RULE&gt; ... next rule ...
+&lt;EOS&gt;</pre>
+
+<p>For a token sequence <code>[t0,t1,t2,t3,t4]</code>, next-token training is shifted by one position:</p>
+<pre>
+INPUT X:   t0  t1  t2  t3
+TARGET Y:  t1  t2  t3  t4
+
+At each position:
+t0          -> predict t1
+t0 t1       -> predict t2
+t0 t1 t2    -> predict t3
+t0 t1 t2 t3 -> predict t4
+</pre>
+</section>
+
+<section id="extract">
+<h2>5. Extract the attached EPUB with Python</h2>
+<p>An EPUB is a ZIP-based container. For a dependency-light teaching version, Python's <code>zipfile</code> can enumerate its XHTML members. The example below deliberately uses a small standard-library HTML parser rather than treating markup tags as training prose.</p>
+
+<pre><code>from pathlib import Path
+from zipfile import ZipFile
+from html.parser import HTMLParser
+import re
+
+EPUB = Path("Creating_Dictionary_Catalouge_Librarians_pg59215-images-3.epub")
+
+
+class TextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+
+    def handle_data(self, data):
+        if data.strip():
+            self.parts.append(data.strip())
+
+    def text(self):
+        return "\n".join(self.parts)
+
+
+def extract_epub(epub_path):
+    documents = []
+
+    with ZipFile(epub_path) as book:
+        members = sorted(
+            name for name in book.namelist()
+            if name.lower().endswith((".xhtml", ".html", ".htm"))
+        )
+
+        for name in members:
+            raw = book.read(name).decode("utf-8", errors="replace")
+
+            parser = TextExtractor()
+            parser.feed(raw)
+
+            text = parser.text()
+            text = re.sub(r"[ \t]+", " ", text)
+            text = re.sub(r"\n{3,}", "\n\n", text)
+
+            documents.append({
+                "source_file": name,
+                "text": text.strip()
+            })
+
+    return documents
+
+
+docs = extract_epub(EPUB)
+
+print("XHTML documents:", len(docs))
+print(docs[0]["text"][:1000])</code></pre>
+
+<p>Do not remove punctuation blindly. In this corpus, punctuation, capitalization, abbreviations, headings, and alphabetical conventions can themselves carry cataloguing information.</p>
+</section>
+
+<section id="parse">
+<h2>6. Catalogue-aware parsing</h2>
+<p><strong>Parsing</strong> here means recognizing document structure; it is distinct from neural tokenization. A first pass can classify headings and common record forms with regular expressions. Python's <code>re</code> module supplies compiled regular-expression matching operations (Python Software Foundation, 2026).</p>
+
+<pre><code>import re
+
+SECTION_PATTERNS = [
+    (r"^I\.\s+Author-Entry", "SECTION_AUTHOR_ENTRY"),
+    (r"^II\.\s+Title-Entry", "SECTION_TITLE_ENTRY"),
+    (r"^III\.\s+Subject-Entry", "SECTION_SUBJECT_ENTRY"),
+    (r"^IV\.\s+Form-Entry", "SECTION_FORM_ENTRY"),
+    (r"^DEFINITIONS\.?$", "SECTION_DEFINITIONS"),
+    (r"^OBJECTS\.?$", "SECTION_OBJECTS"),
+    (r"^MEANS\.?$", "SECTION_MEANS"),
+]
+
+def classify_line(line):
+    clean = line.strip()
+
+    for pattern, label in SECTION_PATTERNS:
+        if re.match(pattern, clean, flags=re.IGNORECASE):
+            return label
+
+    if re.match(r"^\d+\.", clean):
+        return "NUMBERED_ITEM"
+
+    if clean.lower().startswith(("see ", "see also ")):
+        return "REFERENCE"
+
+    return "TEXT"</code></pre>
+
+<p>For this historical document, parsing should be conservative: preserve the source text first, then add labels. A parser that guesses too aggressively can inject incorrect structure into the training data.</p>
+</section>
+
+<section id="tokenize">
+<h2>7. Tokenization</h2>
+<h3>7.1 Educational tokenizer</h3>
+<p>Start with a transparent tokenizer so every transformation can be inspected.</p>
+
+<pre><code>import re
+
+TOKEN_RE = re.compile(
+    r"""&lt;[A-Z_]+&gt;        # structural tokens
+      | [A-Za-zÀ-ÖØ-öø-ÿ]+(?:['’-][A-Za-zÀ-ÖØ-öø-ÿ]+)*
+      | \d+(?:\.\d+)?
+      | [^\s]
+    """,
+    re.VERBOSE
+)
+
+def tokenize(text):
+    return TOKEN_RE.findall(text)
+
+sample = "&lt;DEFINITION&gt; Author, in the narrower sense, is the person..."
+print(tokenize(sample))</code></pre>
+
+<p>Example conceptual output:</p>
+<pre>[
+ "&lt;DEFINITION&gt;",
+ "Author", ",", "in", "the", "narrower", "sense", ",",
+ "is", "the", "person", ".", ".", "."
+]</pre>
+
+<h3>7.2 Vocabulary and integer IDs</h3>
+<pre><code>SPECIAL = ["&lt;PAD&gt;", "&lt;UNK&gt;", "&lt;BOS&gt;", "&lt;EOS&gt;"]
+
+def make_vocab(tokens):
+    vocab = SPECIAL + sorted(set(tokens))
+    stoi = {token: i for i, token in enumerate(vocab)}
+    itos = {i: token for token, i in stoi.items()}
+    return vocab, stoi, itos
+
+def encode(tokens, stoi):
+    unk = stoi["&lt;UNK&gt;"]
+    return [stoi.get(token, unk) for token in tokens]
+
+def decode(ids, itos):
+    return [itos[i] for i in ids]</code></pre>
+
+<pre>
+"Author entry"
+      |
+      v
+["Author", "entry"]
+      |
+      v
+[481, 927]
+      |
+      v
+embedding lookup
+</pre>
+
+<h3>7.3 Why move to subwords later?</h3>
+<p>A word-level vocabulary is easy to understand but handles rare spellings and morphological variants inefficiently. A later version can use a subword model. SentencePiece, for example, can train subword units directly from raw sentences rather than requiring pre-tokenized word input (Kudo &amp; Richardson, 2018). For the first experiment, however, the regex tokenizer makes the complete pipeline visible.</p>
+</section>
+
+<section id="dataset">
+<h2>8. Build fixed-length training examples</h2>
+<pre><code>import torch
+from torch.utils.data import Dataset
+
+class CatalogueDataset(Dataset):
+    def __init__(self, token_ids, context=128):
+        self.ids = token_ids
+        self.context = context
+
+    def __len__(self):
+        return max(0, len(self.ids) - self.context)
+
+    def __getitem__(self, index):
+        chunk = self.ids[index:index + self.context + 1]
+
+        x = torch.tensor(chunk[:-1], dtype=torch.long)
+        y = torch.tensor(chunk[1:], dtype=torch.long)
+
+        return x, y</code></pre>
+
+<p>Split the corpus before training. For a single book, a simple chronological split is useful for a first experiment—for example, approximately 90% training and 10% validation—while recognizing that sections differ in content and length.</p>
+</section>
+
+<section id="model">
+<h2>9. A small causal Transformer in PyTorch</h2>
+<p>PyTorch describes an embedding as a lookup from integer indices to vectors, while its Transformer encoder layer contains self-attention and a feed-forward network (PyTorch Contributors, 2026a, 2026b). We can use those components with a <strong>causal mask</strong> so a token cannot look ahead at the answer it is supposed to predict.</p>
+
+<pre><code>import torch
+import torch.nn as nn
+
+class SmallCatalogueLM(nn.Module):
+    def __init__(
+        self,
+        vocab_size,
+        context=128,
+        d_model=128,
+        heads=4,
+        layers=4,
+        ff=512,
+        dropout=0.1
+    ):
+        super().__init__()
+
+        self.context = context
+
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.position_embedding = nn.Embedding(context, d_model)
+
+        block = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=heads,
+            dim_feedforward=ff,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True
+        )
+
+        self.transformer = nn.TransformerEncoder(
+            block,
+            num_layers=layers
+        )
+
+        self.norm = nn.LayerNorm(d_model)
+        self.output = nn.Linear(d_model, vocab_size)
+
+    def forward(self, token_ids):
+        batch, length = token_ids.shape
+
+        positions = torch.arange(
+            length,
+            device=token_ids.device
+        ).unsqueeze(0)
+
+        x = (
+            self.token_embedding(token_ids)
+            + self.position_embedding(positions)
+        )
+
+        # True above the diagonal prevents access to future tokens.
+        causal_mask = torch.triu(
+            torch.ones(length, length, device=token_ids.device),
+            diagonal=1
+        ).bool()
+
+        x = self.transformer(
+            x,
+            mask=causal_mask
+        )
+
+        x = self.norm(x)
+
+        return self.output(x)</code></pre>
+
+<h3>Tensor flow</h3>
+<pre>
+token IDs                     [B, T]
+   |
+   v
+token embeddings              [B, T, D]
+        +
+position embeddings           [1, T, D]
+   |
+   v
+causal Transformer            [B, T, D]
+   |
+   v
+linear vocabulary projection  [B, T, V]
+   |
+   v
+logits for every next token
+</pre>
+
+<p><code>B</code> = batch size, <code>T</code> = context length, <code>D</code> = embedding/model dimension, and <code>V</code> = vocabulary size.</p>
+</section>
+
+<section id="train">
+<h2>10. Training loop</h2>
+<p>For next-token prediction, each vocabulary item acts as a possible target class. PyTorch's <code>CrossEntropyLoss</code> accepts unnormalized logits and target class indices. AdamW supplies the parameter-update step (PyTorch Contributors, 2026c, 2026d).</p>
+
+<pre><code>import torch
+import torch.nn as nn
+
+device = (
+    "cuda" if torch.cuda.is_available()
+    else "mps" if torch.backends.mps.is_available()
+    else "cpu"
+)
+
+model = SmallCatalogueLM(
+    vocab_size=len(vocab),
+    context=128
+).to(device)
+
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=3e-4,
+    weight_decay=0.01
+)
+
+criterion = nn.CrossEntropyLoss()
+
+for epoch in range(10):
+
+    model.train()
+    total_loss = 0.0
+
+    for x, y in train_loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        optimizer.zero_grad()
+
+        logits = model(x)
+
+        loss = criterion(
+            logits.reshape(-1, logits.size(-1)),
+            y.reshape(-1)
+        )
+
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=1.0
+        )
+
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    average = total_loss / len(train_loader)
+    print(f"epoch={epoch + 1} train_loss={average:.4f}")</code></pre>
+
+<pre>
+FOR EACH BATCH
+     |
+     v
+input token IDs
+     |
+     v
+forward pass
+     |
+     v
+logits
+     |
+     v
+cross-entropy(target IDs)
+     |
+     v
+loss
+     |
+     v
+backward()
+     |
+     v
+gradients
+     |
+     v
+AdamW step
+     |
+     v
+updated parameters
+</pre>
+</section>
+
+<section id="generate">
+<h2>11. Generation</h2>
+<p>At inference time, feed a prompt, take the logits at the final position, convert them to a probability distribution, sample a token, append it, and repeat.</p>
+
+<pre><code>@torch.no_grad()
+def generate(model, ids, max_new_tokens=80, temperature=0.8):
+    model.eval()
+
+    for _ in range(max_new_tokens):
+
+        x = torch.tensor(
+            [ids[-model.context:]],
+            dtype=torch.long,
+            device=next(model.parameters()).device
+        )
+
+        logits = model(x)
+        next_logits = logits[:, -1, :] / temperature
+
+        probabilities = torch.softmax(next_logits, dim=-1)
+
+        next_id = torch.multinomial(
+            probabilities,
+            num_samples=1
+        ).item()
+
+        ids.append(next_id)
+
+    return ids</code></pre>
+
+<p>A lower temperature makes the distribution sharper; a higher temperature increases randomness. For a small single-book model, generated prose may imitate local language without reliably reproducing correct cataloguing rules. Treat it as a learning model, not an authoritative cataloguing system.</p>
+</section>
+
+<section id="evaluation">
+<h2>12. Evaluation</h2>
+<p>Keep validation examples out of parameter updates. Track validation cross-entropy and optionally perplexity:</p>
+
+<pre>perplexity = exp(validation_loss)</pre>
+
+<p>Also perform domain-specific checks:</p>
+<table>
+<tr><th>Check</th><th>Question</th></tr>
+<tr><td>Held-out loss</td><td>Does performance improve on text not used for gradient updates?</td></tr>
+<tr><td>Memorization</td><td>Is the model simply reproducing long passages from this small corpus?</td></tr>
+<tr><td>Structure</td><td>Does it learn that author-, title-, and subject-entry are different catalogue concepts?</td></tr>
+<tr><td>Terminology</td><td>Does it use terms such as entry, reference, heading, subject, imprint, and edition in plausible contexts?</td></tr>
+<tr><td>Ground-truth comparison</td><td>When asked about a rule, does generated language agree with the source passage?</td></tr>
+</table>
+</section>
+
+<section id="method">
+<h2>13. Recommended training methodology</h2>
+<pre>
+STAGE 0 — PRESERVE
+EPUB -> untouched source copy
+
+STAGE 1 — EXTRACT
+EPUB -> XHTML -> Unicode text
+
+STAGE 2 — PARSE
+text -> sections / rules / definitions / examples / references
+
+STAGE 3 — NORMALIZE
+normalize whitespace
+retain meaningful punctuation and historical terminology
+
+STAGE 4 — TOKENIZE
+Version A: transparent regex tokenizer
+Version B: subword tokenizer
+
+STAGE 5 — SPLIT
+training corpus
+validation corpus
+(optional final test corpus)
+
+STAGE 6 — SEQUENCE
+tokens -> IDs -> fixed context windows -> shifted targets
+
+STAGE 7 — TRAIN
+embedding
+  -> position
+  -> causal self-attention
+  -> feed-forward
+  -> vocabulary logits
+  -> cross-entropy
+  -> backpropagation
+  -> AdamW
+
+STAGE 8 — VALIDATE
+held-out loss
+perplexity
+qualitative catalogue prompts
+memorization checks
+
+STAGE 9 — SAVE
+model state
+vocabulary/tokenizer
+configuration
+source/corpus manifest
+
+STAGE 10 — INFERENCE
+prompt -> tokenize -> model -> sample -> decode -> repeat
+</pre>
+
+<h3>Suggested first configuration</h3>
+<table>
+<tr><th>Setting</th><th>Starting value</th><th>Reason</th></tr>
+<tr><td>Context</td><td>128 tokens</td><td>Small enough for experimentation while retaining local rule context.</td></tr>
+<tr><td><code>d_model</code></td><td>128</td><td>Compact embedding/hidden width.</td></tr>
+<tr><td>Attention heads</td><td>4</td><td>Divides 128 cleanly.</td></tr>
+<tr><td>Transformer layers</td><td>4</td><td>Small educational stack.</td></tr>
+<tr><td>Feed-forward width</td><td>512</td><td>4× model width.</td></tr>
+<tr><td>Batch size</td><td>16–32</td><td>Adjust to available memory.</td></tr>
+<tr><td>Learning rate</td><td>3×10<sup>−4</sup></td><td>Reasonable experimental starting point, not a universal optimum.</td></tr>
+<tr><td>Epochs</td><td>Begin around 5–10</td><td>Watch validation loss rather than choosing an arbitrary final count.</td></tr>
+</table>
+
+<div class="box">
+<strong>Important limitation:</strong> one historical book is a very small corpus for a Transformer. This project is best understood as a transparent SLM laboratory. A later catalogue model could add other legitimately usable/public-domain cataloguing texts, while keeping source provenance so that training material can be audited.
+</div>
+
+<h3>Complete conceptual schema</h3>
+<pre>
+SOURCE LAYER
+  EPUB
+    |
+    +-- metadata
+    +-- XHTML chapters
+    +-- headings
+    +-- paragraphs
+
+CORPUS LAYER
+  Document
+    |
+    +-- Section
+          |
+          +-- Rule
+          +-- Definition
+          +-- Example
+          +-- Reference
+          +-- Narrative text
+
+TOKEN LAYER
+  text
+    |
+    +-- tokens
+          |
+          +-- vocabulary ID
+          +-- position ID
+
+DATASET LAYER
+  sequence
+    |
+    +-- X context
+    +-- Y next-token targets
+
+MODEL LAYER
+  token embedding
+       +
+  position embedding
+       |
+       v
+  causal Transformer blocks
+       |
+       v
+  vocabulary logits
+
+LEARNING LAYER
+  logits + targets
+       |
+       v
+  cross-entropy loss
+       |
+       v
+  gradients
+       |
+       v
+  AdamW
+       |
+       v
+  updated weights
+
+INFERENCE LAYER
+  prompt
+    -> IDs
+    -> model
+    -> probabilities
+    -> sample
+    -> new ID
+    -> decode
+</pre>
+</section>
+
+<section id="refs">
+<h2>References — APA 7th edition</h2>
+
+<p class="ref">Cutter, C. A. (1891). <em>Rules for a dictionary catalogue</em> (3rd ed.). Government Printing Office. (Original work supplied as the attached Project Gutenberg EPUB, eBook No. 59215.)</p>
+
+<p class="ref">Kudo, T., &amp; Richardson, J. (2018). SentencePiece: A simple and language independent subword tokenizer and detokenizer for neural text processing. In <em>Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing: System Demonstrations</em> (pp. 66–71). Association for Computational Linguistics. <a href="https://doi.org/10.18653/v1/D18-2012">https://doi.org/10.18653/v1/D18-2012</a></p>
+
+<p class="ref">Project Gutenberg. (2020). <em>Rules for a dictionary catalogue, by Charles A. Cutter</em> (eBook No. 59215). <a href="https://www.gutenberg.org/ebooks/59215">https://www.gutenberg.org/ebooks/59215</a></p>
+
+<p class="ref">Python Software Foundation. (2026). <em>re — Regular expression operations</em>. Python documentation. <a href="https://docs.python.org/3/library/re.html">https://docs.python.org/3/library/re.html</a></p>
+
+<p class="ref">PyTorch Contributors. (2026a). <em>Embedding</em>. PyTorch documentation. <a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Embedding.html">https://docs.pytorch.org/docs/stable/generated/torch.nn.Embedding.html</a></p>
+
+<p class="ref">PyTorch Contributors. (2026b). <em>TransformerEncoderLayer</em>. PyTorch documentation. <a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.TransformerEncoderLayer.html">https://docs.pytorch.org/docs/stable/generated/torch.nn.TransformerEncoderLayer.html</a></p>
+
+<p class="ref">PyTorch Contributors. (2026c). <em>CrossEntropyLoss</em>. PyTorch documentation. <a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html">https://docs.pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html</a></p>
+
+<p class="ref">PyTorch Contributors. (2026d). <em>AdamW</em>. PyTorch documentation. <a href="https://docs.pytorch.org/docs/stable/generated/torch.optim.AdamW.html">https://docs.pytorch.org/docs/stable/generated/torch.optim.AdamW.html</a></p>
+
+<p class="small note">Implementation notes in this page are an educational synthesis. The historical catalogue concepts are grounded in the attached Cutter text; the neural-network architecture and implementation guidance are modern additions rather than claims made by Cutter.</p>
+</section>
+
+</main>
+</body>
+</html>
